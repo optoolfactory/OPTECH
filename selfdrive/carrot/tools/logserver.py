@@ -28,16 +28,22 @@ def log_files():
     names = [f for f in os.listdir(LOG_DIR) if f.endswith(".txt") and os.path.isfile(os.path.join(LOG_DIR, f))]
   except OSError:
     return [], []
-  drives = sorted([f for f in names if f[:1].isdigit()], reverse=True)
+  # newest first by when each was last written: a name from 1970 (clock not set yet) says nothing about its age
+  drives = sorted([f for f in names if f[:1].isdigit()], key=lambda f: os.path.getmtime(os.path.join(LOG_DIR, f)),
+                  reverse=True)
   others = sorted([f for f in names if not f[:1].isdigit()], reverse=True)
   return drives, others
 
 
-def drive_label(name):
-  """20261121-143005.txt -> 11/21 14:30 주행"""
-  if len(name) >= 15 and name[8] == "-":
-    return f"{name[4:6]}/{name[6:8]} {name[9:11]}:{name[11:13]} 주행"
-  return name
+def drive_label(name, mtime):
+  """20261121-143005.txt written until 14:52 -> '11/21 14:30 ~ 14:52 주행'. A drive that started with the clock at 1970
+  (no network time, no GPS fix yet; drivelog renames it once the clock is set) shows what is known."""
+  end = datetime.datetime.fromtimestamp(mtime)
+  if len(name) >= 15 and name[8] == "-" and not name.startswith("19"):
+    return f"{name[4:6]}/{name[6:8]} {name[9:11]}:{name[11:13]} ~ {end:%H:%M} 주행"
+  if end.year >= 2024:
+    return f"{end:%m/%d} ? ~ {end:%H:%M} 주행 (시작 시각 모름)"
+  return f"날짜 모르는 주행 ({name})"
 
 
 def size_text(path):
@@ -50,8 +56,7 @@ def page():
   rows = []
   for f in drives:
     p = os.path.join(LOG_DIR, f)
-    end = datetime.datetime.fromtimestamp(os.path.getmtime(p)).strftime("%H:%M")
-    rows.append(f'<a class="b" href="/f/{html.escape(f)}">{html.escape(drive_label(f))} ~ {end}'
+    rows.append(f'<a class="b" href="/f/{html.escape(f)}">{html.escape(drive_label(f, os.path.getmtime(p)))}'
                 f'<small>{size_text(p)}</small></a>')
   extra = "".join(f'<a class="s" href="/f/{html.escape(f)}">{html.escape(f)} ({size_text(os.path.join(LOG_DIR, f))})</a>'
                   for f in others)
@@ -80,9 +85,16 @@ def zip_all():
   buf = io.BytesIO()
   with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
     for f in drives + others:
+      p = os.path.join(LOG_DIR, f)
       try:
-        z.write(os.path.join(LOG_DIR, f), f)
-      except OSError:
+        # a zip can't hold a time before 1980: z.write() of a file last written while the clock was at 1970 raised
+        # ValueError and stopped the whole download (2026-11-24, Soul EV tester: '다운로드 받을 수 없다')
+        t = time.localtime(os.path.getmtime(p))
+        info = zipfile.ZipInfo(f, date_time=tuple(t[:6]) if t.tm_year >= 1980 else (1980, 1, 1, 0, 0, 0))
+        info.compress_type = zipfile.ZIP_DEFLATED
+        with open(p, "rb") as fh:
+          z.writestr(info, fh.read())
+      except (OSError, ValueError):
         pass
   return buf.getvalue()
 
@@ -98,6 +110,15 @@ class Handler(BaseHTTPRequestHandler):
     self.wfile.write(data)
 
   def do_GET(self):  # noqa: N802
+    try:
+      self.get()
+    except Exception as e:  # noqa: BLE001  (an error otherwise just drops the connection: the phone says nothing useful)
+      try:
+        self.send(500, "text/plain; charset=utf-8", f"기록을 보내지 못했어요: {type(e).__name__}: {e}".encode())
+      except Exception:  # noqa: BLE001
+        pass
+
+  def get(self):
     path = unquote(self.path.split("?")[0])
     if path in ("/", "/index.html"):
       self.send(200, "text/html; charset=utf-8", page().encode())
