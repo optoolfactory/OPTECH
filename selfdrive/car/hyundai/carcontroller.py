@@ -19,6 +19,14 @@ MAX_ANGLE = 85
 MAX_ANGLE_FRAMES = 89
 MAX_ANGLE_CONSECUTIVE_FRAMES = 2
 
+# KIA SOUL EV (SK3), carrot e5cf102 (measured in that car): its MDPS starts taking our torque (MDPS12 ToiActive 0 -> 1)
+# only when the requested torque is near 0 at its check - every start seen was at |torque| <= 9, a steady 30..409 was
+# refused for good. So while it does not take our torque (ignored anyway), send 0 with the request bit still on: it
+# starts at its next check and our torque then ramps up from 0. Carrot also found: do NOT toggle the request bit to
+# coax it (faults the MDPS or turns short slips into full drops); keep the request steady.
+SK3_NOACT_ZERO_FRAMES = 10    # MDPS not taking torque this long (100 Hz, small debounce) -> send 0
+SK3_NOACT_WARN_FRAMES = 100   # ... and this long while moving -> cluster 'keep hands on wheel'
+
 
 def process_hud_alert(enabled, fingerprint, hud_control):
   sys_warning = (hud_control.visualAlert in (VisualAlert.steerRequired, VisualAlert.ldw))
@@ -61,6 +69,9 @@ class CarController:
     self.packer = CANPacker(dbc_name)
     self.angle_limit_counter = 0
     self.frame = 0
+    self.sk3 = CP.carFingerprint == CAR.KIA_SOUL_EV_SK3
+    self.mdps_noact_frames = 0  # SK3: frames the MDPS has not taken our torque while steering is on
+    self.lkas_noact_frames = 0  # SK3: the same while moving (cluster warning)
 
     self.accel_last = 0
     self.apply_steer_last = 0
@@ -132,6 +143,13 @@ class CarController:
     if not CC.latActive:
       apply_steer = 0
 
+    # KIA SOUL EV (SK3): MDPS not taking our torque -> request 0 so it starts, then ramp up from 0 (see SK3_NOACT_*)
+    mdps_noact = self.sk3 and CC.latActive and int(round(getattr(CS, "steer_state", 1))) == 0
+    self.mdps_noact_frames = self.mdps_noact_frames + 1 if mdps_noact else 0
+    self.lkas_noact_frames = self.lkas_noact_frames + 1 if mdps_noact and CS.out.vEgoRaw >= 2.0 else 0
+    if self.mdps_noact_frames >= SK3_NOACT_ZERO_FRAMES:
+      apply_steer = 0
+
     self.apply_steer_last = apply_steer
 
     # accel + longitudinal
@@ -200,6 +218,13 @@ class CarController:
     if self.angle_limit_counter >= self.maxAngleFrames + MAX_ANGLE_CONSECUTIVE_FRAMES:
       self.angle_limit_counter = 0
 
+    if self.sk3:
+      # KIA SOUL EV (SK3), carrot e5cf102: no 2-frame request cut above 85 degrees. This MDPS drops steering at each
+      # cut and has to start again, so it let go over and over through every sharp turn; the >90 degree EPS fault the
+      # cut prevents was never seen on this car (it held steering at 89 degrees under high torque).
+      torque_fault = False
+      lat_active = CC.latActive
+
     # CAN-FD platforms
     if self.CP.carFingerprint in CANFD_CAR:
       hda2 = self.CP.flags & HyundaiFlags.CANFD_HDA2
@@ -249,7 +274,8 @@ class CarController:
       can_sends.append(hyundaican.create_lkas11(self.packer, self.frame, self.car_fingerprint, self.send_lfa_mfa_lkas, apply_steer, lat_active,
                                                 torque_fault, CS.lkas11, sys_warning, sys_state, CC.enabled,
                                                 hud_control.leftLaneVisible or CC.enabled, hud_control.rightLaneVisible or CC.enabled,
-                                                left_lane_warning, right_lane_warning, ldws_car=self.ldws_car))
+                                                left_lane_warning, right_lane_warning, ldws_car=self.ldws_car,
+                                                noact_warning=self.lkas_noact_frames >= SK3_NOACT_WARN_FRAMES))
 
       if not self.CP.openpilotLongitudinalControl:
         if CC.cruiseControl.cancel:

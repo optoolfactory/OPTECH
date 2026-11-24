@@ -263,6 +263,17 @@ void TogglesPanel::updateToggles() {
   }
 }
 
+// Power Off button (Soul EV tester, 2026-11-24): upstream shows it only offroad, but with the harness the car on in P
+// (parking brake on) still counts as onroad, so the screen had no way to turn the device off. Onroad it now shows when
+// the car is in P and openpilot is off. Once the device is off the panda gets no heartbeat, goes to its idle mode
+// after ~5 s and passes the stock camera's messages to the car again (safety_defaults.h nooutput forwarding).
+static bool optech_poweroff_ok(const UIState &s) {
+  if (!s.scene.started) return true;
+  if (s.engaged()) return false;
+  return s.sm->rcv_frame("carState") > s.scene.started_frame &&
+         (*s.sm)["carState"].getCarState().getGearShifter() == cereal::CarState::GearShifter::PARK;
+}
+
 DevicePanel::DevicePanel(SettingsWindow *parent) : ListWidget(parent) {
   setSpacing(50);
   addItem(new LabelControl(tr("동글 ID"), getDongleId().value_or(tr("N/A"))));
@@ -387,7 +398,11 @@ DevicePanel::DevicePanel(SettingsWindow *parent) : ListWidget(parent) {
   QObject::connect(poweroff_btn, &QPushButton::clicked, this, &DevicePanel::poweroff);
 
   if (!Hardware::PC()) {
-    connect(uiState(), &UIState::offroadTransition, poweroff_btn, &QPushButton::setVisible);
+    // was: visible only offroad (offroadTransition)
+    connect(uiState(), &UIState::uiUpdate, poweroff_btn, [=](const UIState &s) {
+      const bool ok = optech_poweroff_ok(s);
+      if (poweroff_btn->isVisibleTo(this) != ok) poweroff_btn->setVisible(ok);
+    });
   }
 
   setStyleSheet(R"(
@@ -439,15 +454,15 @@ void DevicePanel::reboot() {
 }
 
 void DevicePanel::poweroff() {
-  if (!uiState()->engaged()) {
-    if (ConfirmationDialog::confirm(tr("Are you sure you want to power off?"), tr("Power Off"), this)) {
-      // Check engaged again in case it changed while the dialog was open
-      if (!uiState()->engaged()) {
-        Params().putBool("DoShutdown", true);
-      }
-    }
-  } else {
+  if (uiState()->engaged()) {
     ConfirmationDialog::alert(tr("Disengage to Power Off"), this);
+  } else if (!optech_poweroff_ok(*uiState())) {
+    ConfirmationDialog::alert("시동이 켜져 있을 때는 기어를 P에 놓아야 끌 수 있어요.", this);
+  } else if (ConfirmationDialog::confirm(tr("Are you sure you want to power off?"), tr("Power Off"), this)) {
+    // check again in case it changed while the dialog was open (engaged, or out of P with the car on)
+    if (optech_poweroff_ok(*uiState())) {
+      Params().putBool("DoShutdown", true);
+    }
   }
 }
 

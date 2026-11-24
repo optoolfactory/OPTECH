@@ -47,6 +47,13 @@ BTN_KEYS = ("r0", "r1", "s", "g", "c")
 # and the stock camera's FCW state and radar fusion state from LKAS11
 FCA_KEYS = ("fi", "fs", "cf", "cu")
 PANDA_ERR_EVENT_S = 10.  # at most one 'panda CAN errors' event this often
+# In the car the clock often starts at 1970-01-01 09:00: no network time yet and no panda RTC. From this year on the
+# clock (or a GPS time) is taken as right.
+CLOCK_OK_YEAR = 2024
+
+
+def clock_ok(t=None):
+  return datetime.datetime.fromtimestamp(time.time() if t is None else t).year >= CLOCK_OK_YEAR
 
 
 def parse_opt(text):
@@ -98,6 +105,7 @@ class DriveLog:
     self.gps_sats = self.gps_strong = self.gps_cno = 0
     self.gnss_t = self.loc_t = -100.
     self.prev_fix = None
+    self.clock_tried = False  # gps_clock: done (or not needed) for this drive
     self.gps_ant = None
     # read once a second (not in SERVICES: modelV2 is big, procLog only comes every 2 s)
     self.model_sock = messaging.sub_sock("modelV2", conflate=True)
@@ -174,6 +182,24 @@ class DriveLog:
   def event(self, text):
     self.out.write(f"{datetime.datetime.now():%H:%M:%S} ** {text}\n")
 
+  def gps_clock(self, loc):
+    """Clock still at 1970 (no network time, no panda RTC): set it once from the GPS fix, like upstream openpilot's
+    timed. Then the drive file gets its real name (main) and crash files their real time. Only forward from 1970,
+    and only when the GPS time itself looks right."""
+    if clock_ok():
+      self.clock_tried = True
+      return
+    gps_s = loc.unixTimestampMillis / 1000.
+    if not clock_ok(gps_s):
+      return  # no GPS time in this message yet: try again on the next one
+    self.clock_tried = True
+    before = datetime.datetime.now()
+    try:
+      time.clock_settime(time.CLOCK_REALTIME, gps_s)
+      self.event(f"clock set from GPS: {before:%Y-%m-%d %H:%M:%S} -> {datetime.datetime.now():%Y-%m-%d %H:%M:%S}")
+    except (OSError, AttributeError) as e:
+      self.event(f"clock not set from GPS: {type(e).__name__}: {e}")
+
   def step(self):
     for s, sock in self.socks.items():
       msg = messaging.recv_one_or_none(sock)
@@ -205,6 +231,8 @@ class DriveLog:
       self.event(f"gps fix {'on' if fix else 'lost'} (sats {self.gps_sats}, strong {self.gps_strong}"
                  + (f", acc {loc.accuracy:.0f} m)" if fix else ")"))
     self.prev_fix = fix
+    if fix and not self.clock_tried:
+      self.gps_clock(loc)
 
     if ctl is not None:
       engage = (ctl.enabled, ctl.active)
@@ -345,6 +373,31 @@ class DriveLog:
       self.proc_prev = (now, snap)
 
 
+def free_path(start):
+  """<date>-<time>.txt for a drive that started at `start`, -1, -2 ... when that name is taken: with the clock at
+  1970 the same name comes back, and a drive is never appended to an older one."""
+  base = os.path.join(LOG_DIR, start.strftime("%Y%m%d-%H%M%S"))
+  path, n = base + ".txt", 1
+  while os.path.exists(path):
+    path, n = f"{base}-{n}.txt", n + 1
+  return path
+
+
+def rename_for_clock(log, path, start_mono):
+  """The drive started with the clock at 1970 and now it is set (GPS or network time): give the file its real start
+  time, so the phone page and the zip show the right date."""
+  start = datetime.datetime.now() - datetime.timedelta(seconds=time.monotonic() - start_mono)
+  new = free_path(start)
+  try:
+    os.rename(path, new)  # the open file keeps being written under the new name
+  except OSError as e:
+    log.event(f"drive file not renamed: {e}")
+    return path
+  log.event(f"clock set: this drive started {start:%Y-%m-%d %H:%M:%S}, the times above are the unset clock "
+            f"(file {os.path.basename(path)} -> {os.path.basename(new)})")
+  return new
+
+
 def main():
   os.makedirs(LOG_DIR, exist_ok=True)
   # drive logs (<date>-<time>[-n].txt, also 1970... when the clock was not set yet) and crash tracebacks are kept
@@ -358,12 +411,9 @@ def main():
       except OSError:
         pass
 
-  # in the car the clock often starts at 1970-01-01 09:00 (no network time yet), so the same name comes back:
-  # never append to an older drive
-  base = os.path.join(LOG_DIR, datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
-  path, n = base + ".txt", 1
-  while os.path.exists(path):
-    path, n = f"{base}-{n}.txt", n + 1
+  start_mono = time.monotonic()
+  path = free_path(datetime.datetime.now())
+  name_unset = not clock_ok()  # named 1970...: renamed once the clock is set (DriveLog.gps_clock or network time)
   with open(path, "a", buffering=1, encoding="utf8") as out:
     out.write(HEADER + "\n")
     log = DriveLog(out)
@@ -387,6 +437,9 @@ def main():
           os.fsync(out.fileno())
         except OSError:
           pass
+        if name_unset and clock_ok():
+          name_unset = False
+          path = rename_for_clock(log, path, start_mono)
       time.sleep(0.1)
 
 

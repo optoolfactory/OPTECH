@@ -9,7 +9,7 @@ hyundai_checksum = crcmod.mkCrcFun(0x11D, initCrc=0xFD, rev=False, xorOut=0xdf)
 def create_lkas11(packer, frame, car_fingerprint, send_lfa_mfa, apply_steer, steer_req,
                   torque_fault, lkas11, sys_warning, sys_state, enabled,
                   left_lane, right_lane,
-                  left_lane_depart, right_lane_depart, ldws_car=False):
+                  left_lane_depart, right_lane_depart, ldws_car=False, noact_warning=False):
   values = lkas11
   values["CF_Lkas_LdwsSysState"] = sys_state
   values["CF_Lkas_SysWarning"] = 0 # ajouatom: 계기판에 안나오게함..   #3 if sys_warning else 0
@@ -67,6 +67,11 @@ def create_lkas11(packer, frame, car_fingerprint, send_lfa_mfa, apply_steer, ste
   # optech '토글 > LDWS 차량' (OPKR LdwsCarFix): cars with lane departure warning only, no lane keeping assist
   if ldws_car:
     values["CF_Lkas_LdwsOpt_USM"] = 3
+
+  # KIA SOUL EV (SK3), carrot e5cf102: steering is on but the MDPS has not taken our torque for 1 s while moving ->
+  # the car's own 'keep hands on wheel' cluster warning (display only; carcontroller SK3_NOACT_WARN_FRAMES)
+  if noact_warning:
+    values["CF_Lkas_SysWarning"] = 4
 
   dat = packer.make_can_msg("LKAS11", 0, values)[2]
 

@@ -14,6 +14,12 @@ PREV_BUTTON_SAMPLES = 8
 CLUSTER_SAMPLE_RATE = 20  # frames
 GearShifter = car.CarState.GearShifter
 
+# KIA SOUL EV (SK3), carrot e5cf102: TCS13 ACCEnable (0 = ACC allowed, 1-3 = not) blips non-zero for 1-2 frames
+# with no real fault, and openpilot turned off at once (accFaulted = immediate disable; with openpilot long and the
+# SCC radar off cruiseState.available comes from the same signal = wrongCarMode). On this car it counts only after
+# this many frames in a row (100 Hz, ~70 ms); a real lasting fault still turns openpilot off within ~70 ms.
+ACC_FAULT_DEBOUNCE_FRAMES = 7
+
 def driver_pressed(gas, gas2):
   from selfdrive.car.hyundai.pedal import driver_pressed as _pressed
   return _pressed(gas, gas2)
@@ -72,6 +78,15 @@ class CarState(CarStateBase):
 
     self.totalDistance = 0.0
     self.speedLimitDistance = 0
+    self.acc_fault_frames = 0  # KIA SOUL EV (SK3): TCS13 ACCEnable != 0 frames in a row (ACC_FAULT_DEBOUNCE_FRAMES)
+
+  def acc_disabled(self, cp):
+    """TCS13 ACCEnable says ACC is not allowed (1-3). Soul EV (SK3): only after ACC_FAULT_DEBOUNCE_FRAMES in a row."""
+    raw = cp.vl["TCS13"]["ACCEnable"] != 0
+    if self.CP.carFingerprint != CAR.KIA_SOUL_EV_SK3:
+      return raw
+    self.acc_fault_frames = min(self.acc_fault_frames + 1, ACC_FAULT_DEBOUNCE_FRAMES) if raw else 0
+    return self.acc_fault_frames >= ACC_FAULT_DEBOUNCE_FRAMES
 
   def update(self, cp, cp_cam):
     if self.CP.carFingerprint in CANFD_CAR:
@@ -126,6 +141,7 @@ class CarState(CarStateBase):
     ret.steerFaultTemporary = False
 
     # cruise state
+    acc_disabled = self.acc_disabled(cp)  # once per frame: it counts frames on the Soul EV (SK3)
     ret.cruiseState.pcmMode = self.prev_pcmMode
     if self.CP.flags & HyundaiFlags.NON_SCC:
       avail_msg, avail_sig, on_msg, on_sig, speed_msg, speed_sig = non_scc_cruise_signals(self.CP)
@@ -135,7 +151,7 @@ class CarState(CarStateBase):
       ret.cruiseState.speed = cp.vl[speed_msg][speed_sig] * speed_conv
     elif self.CP.openpilotLongitudinalControl and self.CP.sccBus == 0: # SCC0: Disable SCC Module
       # These are not used for engage/disengage since openpilot keeps track of state using the buttons
-      ret.cruiseState.available = cp.vl["TCS13"]["ACCEnable"] == 0
+      ret.cruiseState.available = not acc_disabled
       ret.cruiseState.enabled = cp.vl["TCS13"]["ACC_REQ"] == 1
       ret.cruiseState.standstill = False
     elif self.CP.openpilotLongitudinalControl: # SCC2 배선개조된경우
@@ -145,7 +161,7 @@ class CarState(CarStateBase):
         ret.cruiseState.standstill = False
         ret.cruiseState.pcmMode = True
       else:
-        ret.cruiseState.available = cp.vl["TCS13"]["ACCEnable"] == 0
+        ret.cruiseState.available = not acc_disabled
         ret.cruiseState.enabled = cp.vl["TCS13"]["ACC_REQ"] == 1
         ret.cruiseState.standstill = False
     else:
@@ -186,7 +202,7 @@ class CarState(CarStateBase):
       ret.brakePressed = cp.vl["E_EMS11"]["Brake_Pedal_Pos"] > 0  # no TCS13 on this car (Porter II EV, carrot)
     ret.brakeHoldActive = cp.vl["TCS15"]["AVH_LAMP"] == 2 # 0 OFF, 1 ERROR, 2 ACTIVE, 3 READY
     ret.parkingBrake = cp.vl["TCS13"]["PBRAKE_ACT"] == 1
-    ret.accFaulted = cp.vl["TCS13"]["ACCEnable"] != 0  # 0 ACC CONTROL ENABLED, 1-3 ACC CONTROL DISABLED
+    ret.accFaulted = acc_disabled  # TCS13 ACCEnable: 0 ACC CONTROL ENABLED, 1-3 ACC CONTROL DISABLED
     if self.CP.flags & HyundaiFlags.NON_SCC:
       ret.accFaulted = False  # TCS13 ACCEnable means nothing without SCC
     ret.brakeLights = bool(cp.vl["TCS13"]["BrakeLight"] or ret.brakePressed)

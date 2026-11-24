@@ -696,8 +696,9 @@ class LongitudinalMpc:
     # the HUD traffic light and the green light alert now come from StarPilot's stop light detector (optech_signal.py),
     # display / alert only
     lead = radarstate.leadOne
-    acc = model.acceleration.x
-    model_accel = float(sum(acc[:11]) / len(acc[:11])) if len(acc) else 0.
+    # a capnp list (pycapnp 1.x on the device) can't be sliced: acc[:11] raised TypeError and stopped plannerd
+    acc = list(model.acceleration.x)[:11]
+    model_accel = float(sum(acc) / len(acc)) if len(acc) else 0.
     if self.optechSignalEnable:
       self.optech_signal.update(v_ego, float(x[-1]) if len(x) else 1000., model_accel, carstate.standstill,
                                 carstate.leftBlinker or carstate.rightBlinker, carstate.steeringAngleDeg,
